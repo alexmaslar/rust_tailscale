@@ -1,0 +1,56 @@
+[package]
+name = "rust_tailscale"
+version = "0.1.0"
+edition = "2021"
+description = "Pure Rust Tailscale networking - embed Tailscale directly into Rust binaries"
+license = "MIT"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "macros", "time"] }
+
+# WireGuard
+boringtun = "0.7"
+
+# Userspace TCP/IP stack
+smoltcp = { version = "0.11", features = ["medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "async"] }
+
+# Noise protocol (control plane auth)
+snow = "0.9"
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+
+# TLS
+tokio-rustls = "0.26"
+rustls = "0.23"
+webpki-roots = "1"
+
+# Crypto
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+rand = "0.8"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+
+# Error handling
+thiserror = "2"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Async utilities
+async-trait = "0.1"
+futures = "0.3"
+pin-project-lite = "0.2"
+
+# Misc
+base64 = "0.22"
+bytes = "1"
+url = "2"
+
+[dev-dependencies]
+tokio-test = "0.4"
