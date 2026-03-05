@@ -25,3 +25,30 @@ impl TailscaleListener {
         self.local_port
     }
 }
+
+#[cfg(feature = "axum")]
+impl axum::serve::Listener for TailscaleListener {
+    type Io = TailscaleStream;
+    type Addr = SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            match self.incoming.recv().await {
+                Some((stream, addr)) => return (stream, addr),
+                None => {
+                    // Channel closed — sleep briefly and retry to avoid busy-spinning.
+                    // In practice this means the tailnet stack shut down.
+                    tracing::warn!("tailscale listener channel closed, retrying...");
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+            }
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        Ok(SocketAddr::new(
+            std::net::Ipv4Addr::UNSPECIFIED.into(),
+            self.local_port,
+        ))
+    }
+}

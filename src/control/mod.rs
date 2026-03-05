@@ -2,11 +2,13 @@ pub mod auth;
 pub mod http;
 pub mod netmap;
 pub mod noise;
+pub mod stream;
 
 pub use auth::{RegisterRequest, RegisterResponse};
 pub use http::ControlHttp;
 pub use netmap::{DerpMap, DerpRegion, IpNet, NetworkMap, PeerInfo, SelfNode};
 pub use noise::NoiseSession;
+pub use stream::NoiseStream;
 
 use crate::config::TailscaleConfig;
 use crate::error::{Result, TailscaleError};
@@ -38,9 +40,9 @@ impl ControlClient {
     /// Authenticate with the control server and retrieve the initial network map.
     ///
     /// This performs the following steps:
-    /// 1. Noise IK handshake to establish an encrypted channel
+    /// 1. Noise IK handshake to establish an encrypted channel (HTTP/2 over Noise)
     /// 2. Register this node using the configured pre-auth key
-    /// 3. Receive and parse the initial network map
+    /// 3. Send a map request to receive the network map
     pub async fn authenticate(&mut self) -> Result<NetworkMap> {
         tracing::info!(
             control_url = %self.config.control_url(),
@@ -48,34 +50,50 @@ impl ControlClient {
             "authenticating with control server"
         );
 
-        // Step 1: Establish Noise session
-        let mut session = noise::perform_handshake(
+        // Step 1: Establish HTTP/2-over-Noise connection
+        let mut control_http = ControlHttp::connect(
+            self.config.control_url().to_string(),
             &self.machine_key,
-            self.config.control_url(),
             &self.http_client,
         )
         .await?;
 
         // Step 2: Register with pre-auth key
-        let reg_req = RegisterRequest {
-            auth_key: self.config.auth_key.clone(),
-            hostname: self.config.hostname.clone(),
-            node_key: self.node_key.public_key_string(),
-            ephemeral: self.config.ephemeral,
-        };
-
-        let reg_response = auth::register(&mut session, reg_req).await?;
-        tracing::info!(
-            node_id = %reg_response.node_id,
-            login = %reg_response.login_name,
-            "registered with control server"
+        let reg_req = auth::build_register_request(
+            &self.node_key.public_key_string(),
+            &self.config.auth_key,
+            &self.config.hostname,
+            self.config.ephemeral,
         );
 
-        // Step 3: The registration response typically includes the initial
-        // network map. In a full implementation we would parse it here.
-        // TODO: Parse the network map from the registration/map response
-        Err(TailscaleError::Control(
-            "authenticate not yet fully implemented".into(),
-        ))
+        let _reg_response = auth::register(&mut control_http, reg_req).await?;
+
+        // Step 3: Get the network map
+        // The registration response may include the node info directly.
+        // If so, we still need to send a MapRequest to get the full network map
+        // (peers, DERP map, etc.)
+        let map_request = serde_json::json!({
+            "Version": 68,
+            "Stream": false,
+            "NodeKey": self.node_key.public_key_string(),
+        });
+
+        let map_body = serde_json::to_vec(&map_request)
+            .map_err(|e| TailscaleError::Control(format!("failed to serialize map request: {e}")))?;
+
+        let map_response_bytes = control_http
+            .post_request("/machine/map", &map_body)
+            .await?;
+
+        let network_map = netmap::parse_network_map(&map_response_bytes)?;
+
+        tracing::info!(
+            ipv4 = %network_map.self_node.ipv4,
+            fqdn = %network_map.self_node.fqdn,
+            peers = network_map.peers.len(),
+            "received network map"
+        );
+
+        Ok(network_map)
     }
 }

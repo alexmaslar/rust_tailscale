@@ -1,80 +1,117 @@
 use crate::error::{Result, TailscaleError};
 use crate::keys::MachineKey;
+use bytes::Bytes;
 
-use super::noise::NoiseSession;
+use super::stream::NoiseStream;
 
-/// HTTP transport layer for control plane communication.
+/// HTTP/2 transport layer for control plane communication over a Noise session.
+///
+/// After the Noise handshake completes, this wraps the encrypted stream
+/// in an h2 client and sends HTTP/2 requests through it.
 pub struct ControlHttp {
     base_url: String,
-    client: reqwest::Client,
+    sender: h2::client::SendRequest<Bytes>,
+    /// Background h2 connection driver task
+    _conn_handle: tokio::task::JoinHandle<()>,
 }
 
 impl ControlHttp {
-    pub fn new(base_url: String, client: reqwest::Client) -> Self {
-        Self { base_url, client }
+    /// Create a new ControlHttp by performing the Noise handshake and
+    /// establishing an HTTP/2 connection over the encrypted stream.
+    pub async fn connect(
+        base_url: String,
+        machine_key: &MachineKey,
+        http_client: &reqwest::Client,
+    ) -> Result<Self> {
+        // Perform the Noise IK handshake (includes key fetch + HTTP upgrade)
+        let (session, tls_stream) =
+            super::noise::perform_handshake(machine_key, &base_url, http_client).await?;
+
+        // Wrap in NoiseStream for transparent encrypt/decrypt
+        let noise_stream = NoiseStream::new(tls_stream, session);
+
+        // Establish HTTP/2 connection over the Noise stream
+        let (sender, conn) = h2::client::handshake(noise_stream)
+            .await
+            .map_err(|e| TailscaleError::Control(format!("h2 handshake failed: {e}")))?;
+
+        // Spawn the h2 connection driver
+        let conn_handle = tokio::spawn(async move {
+            if let Err(e) = conn.await {
+                tracing::warn!("h2 connection error: {e}");
+            }
+        });
+
+        tracing::info!("HTTP/2 over Noise connection established");
+
+        Ok(Self {
+            base_url,
+            sender,
+            _conn_handle: conn_handle,
+        })
     }
 
-    /// Upgrade an HTTP connection to a Noise session.
+    /// Send a POST request through the HTTP/2-over-Noise connection.
     ///
-    /// This initiates the ts2021 protocol by connecting to the /ts2021
-    /// endpoint and performing the Noise IK handshake.
-    pub async fn noise_upgrade(&self, machine_key: &MachineKey) -> Result<NoiseSession> {
-        super::noise::perform_handshake(machine_key, &self.base_url, &self.client).await
-    }
-
-    /// Send a POST request through an established Noise session.
-    ///
-    /// The request body is encrypted with the Noise session, sent to the
-    /// control server, and the response is decrypted and returned.
-    ///
-    /// TODO: The real implementation sends framed Noise messages over the
-    /// upgraded HTTP connection. This stub encrypts/decrypts but does not
-    /// perform actual network I/O since the HTTP upgrade is not yet implemented.
-    pub async fn post_request(
-        &self,
-        session: &mut NoiseSession,
-        endpoint: &str,
-        body: &[u8],
-    ) -> Result<Vec<u8>> {
+    /// The encryption is handled transparently by the NoiseStream layer.
+    pub async fn post_request(&mut self, endpoint: &str, body: &[u8]) -> Result<Vec<u8>> {
         tracing::debug!("control POST {} ({} bytes)", endpoint, body.len());
 
-        let encrypted = session.encrypt(body)?;
+        // Build the HTTP/2 request
+        let request = http::Request::builder()
+            .method("POST")
+            .uri(endpoint)
+            .header("content-type", "application/json")
+            .body(())
+            .map_err(|e| TailscaleError::Control(format!("failed to build request: {e}")))?;
 
-        // TODO: Send the encrypted payload over the upgraded connection.
-        // The ts2021 protocol uses a framing format:
-        //   - 2 bytes: frame type
-        //   - 4 bytes: payload length (big-endian)
-        //   - N bytes: encrypted payload
-        //
-        // For now, we cannot actually send since the HTTP upgrade is stubbed.
-        let _ = encrypted;
+        // Send request headers
+        let (response_future, mut send_stream) = self
+            .sender
+            .send_request(request, false)
+            .map_err(|e| TailscaleError::Control(format!("h2 send_request failed: {e}")))?;
 
-        Err(TailscaleError::Control(format!(
-            "HTTP transport not yet implemented for endpoint: {endpoint}"
-        )))
+        // Send request body
+        send_stream
+            .send_data(Bytes::copy_from_slice(body), true)
+            .map_err(|e| TailscaleError::Control(format!("h2 send_data failed: {e}")))?;
+
+        // Await response headers
+        let response = response_future
+            .await
+            .map_err(|e| TailscaleError::Control(format!("h2 response error: {e}")))?;
+
+        let status = response.status();
+        tracing::debug!("control response: HTTP {}", status);
+
+        // Read response body
+        let mut body_stream = response.into_body();
+        let mut response_bytes = Vec::new();
+
+        while let Some(chunk) = body_stream
+            .data()
+            .await
+        {
+            let chunk = chunk
+                .map_err(|e| TailscaleError::Control(format!("h2 body read error: {e}")))?;
+            response_bytes.extend_from_slice(&chunk);
+
+            // Release flow control capacity
+            let _ = body_stream.flow_control().release_capacity(chunk.len());
+        }
+
+        if !status.is_success() {
+            return Err(TailscaleError::Control(format!(
+                "control server returned HTTP {}: {}",
+                status,
+                String::from_utf8_lossy(&response_bytes)
+            )));
+        }
+
+        Ok(response_bytes)
     }
-}
 
-/// Perform a Noise upgrade on an HTTP connection.
-///
-/// Convenience function that creates a `ControlHttp` and performs the upgrade.
-pub async fn noise_upgrade(
-    base_url: &str,
-    client: &reqwest::Client,
-    machine_key: &MachineKey,
-) -> Result<NoiseSession> {
-    let http = ControlHttp::new(base_url.to_string(), client.clone());
-    http.noise_upgrade(machine_key).await
-}
-
-/// Send a POST request through an existing Noise session.
-///
-/// Convenience function wrapping `ControlHttp::post_request`.
-pub async fn post_request(
-    http: &ControlHttp,
-    session: &mut NoiseSession,
-    endpoint: &str,
-    body: &[u8],
-) -> Result<Vec<u8>> {
-    http.post_request(session, endpoint, body).await
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
 }

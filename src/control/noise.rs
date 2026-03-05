@@ -1,22 +1,15 @@
 use crate::error::{Result, TailscaleError};
 use crate::keys::MachineKey;
 use snow::TransportState;
+use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio_rustls::client::TlsStream;
 
 /// An established Noise IK session for communicating with the control plane.
 pub struct NoiseSession {
     transport: TransportState,
 }
-
-/// Tailscale control plane's well-known static public key.
-/// This is the key for controlplane.tailscale.com (ts2021 protocol).
-/// TODO: Verify this is the correct key; this is a placeholder derived from
-/// Tailscale's public documentation and source code.
-const CONTROL_PLANE_PUBLIC_KEY: [u8; 32] = [
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-]; // TODO: Replace with actual Tailscale control plane public key
 
 impl NoiseSession {
     /// Wrap an already-completed transport state.
@@ -47,6 +40,44 @@ impl NoiseSession {
     }
 }
 
+/// Fetch the control server's Noise public key from /key?v=68.
+///
+/// Response JSON: `{"LegacyPublicKey":"...","PublicKey":"nodekey:base64..."}`
+pub async fn fetch_server_key(
+    control_url: &str,
+    client: &reqwest::Client,
+) -> Result<[u8; 32]> {
+    let url = format!("{}/key?v=68", control_url.trim_end_matches('/'));
+    tracing::debug!("fetching server noise key from {}", url);
+
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| TailscaleError::Control(format!("failed to fetch server key: {e}")))?;
+
+    if !resp.status().is_success() {
+        return Err(TailscaleError::Control(format!(
+            "server key fetch returned HTTP {}",
+            resp.status()
+        )));
+    }
+
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| TailscaleError::Control(format!("failed to parse key response: {e}")))?;
+
+    // The PublicKey field is "nodekey:<base64url>" format
+    let key_str = body["PublicKey"]
+        .as_str()
+        .ok_or_else(|| TailscaleError::Control("key response missing PublicKey field".into()))?;
+
+    let (_prefix, key_bytes) = crate::keys::parse_key(key_str)?;
+    tracing::debug!("fetched server noise key");
+    Ok(key_bytes)
+}
+
 /// Build a snow initiator for the Noise_IK handshake.
 ///
 /// Pattern IK: the initiator knows the responder's static public key.
@@ -70,69 +101,223 @@ fn build_initiator(
         .map_err(|e| TailscaleError::Control(format!("failed to build noise initiator: {e}")))
 }
 
-/// Perform the Noise IK handshake with the control server.
+/// Perform the Noise IK handshake with the control server via HTTP upgrade.
 ///
-/// This upgrades an HTTP connection at the /ts2021 endpoint to a Noise
-/// transport. The machine key serves as the initiator's static key.
+/// Flow:
+/// 1. Fetch server's Noise public key from /key?v=68
+/// 2. Open TLS connection to control server
+/// 3. Send HTTP upgrade: POST /ts2021 with Noise msg1 in body
+/// 4. Server responds 101 with Noise msg2 in body
+/// 5. Transition to transport mode
 ///
-/// TODO: This is a stub. The real implementation needs to:
-/// 1. POST to {control_url}/ts2021 with upgrade headers
-/// 2. Send handshake message 1 (-> e, es, s, ss)
-/// 3. Receive handshake message 2 (<- e, ee, se)
-/// 4. Transition to transport mode
+/// Returns the NoiseSession and the underlying TLS stream for further I/O.
 pub async fn perform_handshake(
     machine_key: &MachineKey,
     control_url: &str,
-    _http_client: &reqwest::Client,
-) -> Result<NoiseSession> {
+    http_client: &reqwest::Client,
+) -> Result<(NoiseSession, TlsStream<TcpStream>)> {
     tracing::info!("initiating Noise IK handshake with control server");
 
-    // TODO: The actual Tailscale ts2021 protocol fetches the server's key
-    // from /key?v=... before initiating the handshake. For now we use the
-    // placeholder constant.
-    let server_key = &CONTROL_PLANE_PUBLIC_KEY;
+    // Step 1: Fetch server's Noise public key
+    let server_key = fetch_server_key(control_url, http_client).await?;
 
-    let mut handshake = build_initiator(machine_key, server_key)?;
-
-    // Step 1: Build initiator message (-> e, es, s, ss)
-    let mut msg1 = vec![0u8; 96]; // 32 (e) + 32 (encrypted s) + 16 (tag) + padding
+    // Step 2: Build the Noise initiator and generate msg1
+    let mut handshake = build_initiator(machine_key, &server_key)?;
+    let mut msg1 = vec![0u8; 96];
     let msg1_len = handshake
         .write_message(&[], &mut msg1)
         .map_err(|e| TailscaleError::Control(format!("handshake write failed: {e}")))?;
     msg1.truncate(msg1_len);
 
-    // TODO: Send msg1 to the control server via HTTP upgrade at /ts2021
-    // and read back the server's response message.
-    //
-    // The actual flow:
-    //   POST {control_url}/ts2021
-    //   Upgrade: tailscale-control-protocol
-    //   Content-Type: application/octet-stream
-    //   Body: msg1
-    //
-    //   Response: 101 Switching Protocols with msg2 in body
-    //
-    // For now, return an error since we cannot complete the handshake
-    // without a real server connection.
-    tracing::warn!(
-        "Noise handshake stub: cannot complete without server connection to {}",
-        control_url
+    // Step 3: Parse control URL, resolve hostname, open TLS connection
+    let parsed = url::Url::parse(control_url)
+        .map_err(|e| TailscaleError::Control(format!("invalid control URL: {e}")))?;
+    let hostname = parsed
+        .host_str()
+        .ok_or_else(|| TailscaleError::Control("control URL has no host".into()))?;
+    let port = parsed.port().unwrap_or(443);
+
+    // DNS resolve
+    let addr = tokio::net::lookup_host(format!("{hostname}:{port}"))
+        .await
+        .map_err(|e| TailscaleError::Control(format!("DNS resolve failed: {e}")))?
+        .next()
+        .ok_or_else(|| TailscaleError::Control("DNS returned no addresses".into()))?;
+
+    // TCP connect
+    let tcp = TcpStream::connect(addr)
+        .await
+        .map_err(|e| TailscaleError::Control(format!("TCP connect failed: {e}")))?;
+
+    // TLS handshake
+    let mut root_store = rustls::RootCertStore::empty();
+    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let tls_config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
+    let server_name = rustls::pki_types::ServerName::try_from(hostname.to_string())
+        .map_err(|e| TailscaleError::Control(format!("invalid server name: {e}")))?;
+    let mut tls_stream = connector
+        .connect(server_name, tcp)
+        .await
+        .map_err(|e| TailscaleError::Control(format!("TLS connect failed: {e}")))?;
+
+    // Step 4: Send HTTP upgrade request with msg1 as body
+    // Tailscale's ts2021 protocol: the machine key is sent as the Upgrade header value
+    // to help the server identify which Noise key to use.
+    let machine_key_str = machine_key.public_key_string();
+    let upgrade_request = format!(
+        "POST /ts2021 HTTP/1.1\r\n\
+         Host: {hostname}\r\n\
+         Upgrade: tailscale-control-protocol\r\n\
+         Connection: Upgrade\r\n\
+         X-Tailscale-Handshake-Machine-Key: {machine_key_str}\r\n\
+         Content-Type: application/octet-stream\r\n\
+         Content-Length: {}\r\n\
+         \r\n",
+        msg1.len()
     );
 
-    // Step 2: Would read server response and process it
-    // let msg2 = ... ; // read from server
-    // let mut payload = vec![0u8; 64];
-    // handshake.read_message(&msg2, &mut payload)?;
+    tls_stream
+        .write_all(upgrade_request.as_bytes())
+        .await
+        .map_err(|e| TailscaleError::Control(format!("failed to write upgrade request: {e}")))?;
+    tls_stream
+        .write_all(&msg1)
+        .await
+        .map_err(|e| TailscaleError::Control(format!("failed to write msg1: {e}")))?;
+    tls_stream
+        .flush()
+        .await
+        .map_err(|e| TailscaleError::Control(format!("failed to flush: {e}")))?;
 
-    // Step 3: Transition to transport mode
-    // let transport = handshake.into_transport_mode()?;
+    // Step 5: Read HTTP 101 response
+    let mut response_buf = vec![0u8; 4096];
+    let mut total_read = 0;
+    let header_end;
 
-    Err(TailscaleError::Control(
-        "Noise handshake not yet implemented: requires real HTTP upgrade connection".into(),
-    ))
+    loop {
+        let n = tls_stream
+            .read(&mut response_buf[total_read..])
+            .await
+            .map_err(|e| TailscaleError::Control(format!("failed to read response: {e}")))?;
+        if n == 0 {
+            return Err(TailscaleError::Control(
+                "connection closed during handshake".into(),
+            ));
+        }
+        total_read += n;
+
+        // Look for end of HTTP headers
+        if let Some(pos) = find_header_end(&response_buf[..total_read]) {
+            header_end = pos;
+            break;
+        }
+
+        if total_read >= response_buf.len() {
+            return Err(TailscaleError::Control(
+                "HTTP response headers too large".into(),
+            ));
+        }
+    }
+
+    // Parse status line
+    let headers_str = std::str::from_utf8(&response_buf[..header_end])
+        .map_err(|_| TailscaleError::Control("non-UTF8 HTTP response".into()))?;
+
+    let status_line = headers_str
+        .lines()
+        .next()
+        .ok_or_else(|| TailscaleError::Control("empty HTTP response".into()))?;
+
+    if !status_line.contains("101") {
+        return Err(TailscaleError::Control(format!(
+            "expected HTTP 101, got: {status_line}"
+        )));
+    }
+
+    tracing::debug!("received HTTP 101 Switching Protocols");
+
+    // Extract Content-Length from response headers (for msg2 body)
+    let content_length = parse_content_length(headers_str);
+
+    // The body starts after the header end (\r\n\r\n = 4 bytes)
+    let body_start = header_end + 4;
+    let mut msg2 = Vec::new();
+
+    // Collect any body bytes already read
+    if body_start < total_read {
+        msg2.extend_from_slice(&response_buf[body_start..total_read]);
+    }
+
+    // Read remaining body bytes if Content-Length tells us we need more
+    if let Some(cl) = content_length {
+        while msg2.len() < cl {
+            let mut tmp = vec![0u8; cl - msg2.len()];
+            let n = tls_stream
+                .read(&mut tmp)
+                .await
+                .map_err(|e| TailscaleError::Control(format!("failed to read msg2: {e}")))?;
+            if n == 0 {
+                break;
+            }
+            msg2.extend_from_slice(&tmp[..n]);
+        }
+    } else if msg2.is_empty() {
+        // No Content-Length header and no body yet — read a chunk
+        // The server should send msg2 (48 bytes for Noise IK responder message)
+        let mut tmp = vec![0u8; 256];
+        let n = tls_stream
+            .read(&mut tmp)
+            .await
+            .map_err(|e| TailscaleError::Control(format!("failed to read msg2: {e}")))?;
+        msg2.extend_from_slice(&tmp[..n]);
+    }
+
+    if msg2.is_empty() {
+        return Err(TailscaleError::Control(
+            "no Noise msg2 in upgrade response".into(),
+        ));
+    }
+
+    // Step 6: Process msg2 and transition to transport mode
+    let mut payload = vec![0u8; 256];
+    let payload_len = handshake
+        .read_message(&msg2, &mut payload)
+        .map_err(|e| TailscaleError::Control(format!("handshake read_message failed: {e}")))?;
+
+    if payload_len > 0 {
+        tracing::debug!(
+            "handshake payload: {} bytes (protocol version info)",
+            payload_len
+        );
+    }
+
+    let transport = handshake
+        .into_transport_mode()
+        .map_err(|e| TailscaleError::Control(format!("failed to enter transport mode: {e}")))?;
+
+    tracing::info!("Noise IK handshake complete");
+
+    Ok((NoiseSession::from_transport(transport), tls_stream))
 }
 
-/// Return the control plane's expected public key.
-pub fn control_plane_public_key() -> &'static [u8; 32] {
-    &CONTROL_PLANE_PUBLIC_KEY
+/// Find the position of \r\n\r\n in the buffer (returns position of first \r).
+fn find_header_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4)
+        .position(|w| w == b"\r\n\r\n")
+}
+
+/// Parse Content-Length from raw HTTP headers.
+fn parse_content_length(headers: &str) -> Option<usize> {
+    for line in headers.lines() {
+        if let Some(val) = line.strip_prefix("Content-Length:") {
+            return val.trim().parse().ok();
+        }
+        if let Some(val) = line.strip_prefix("content-length:") {
+            return val.trim().parse().ok();
+        }
+    }
+    None
 }
