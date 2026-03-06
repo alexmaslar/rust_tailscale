@@ -2,6 +2,7 @@ pub mod auth;
 pub mod http;
 pub mod netmap;
 pub mod noise;
+mod resolver;
 pub mod stream;
 
 pub use auth::{RegisterRequest, RegisterResponse};
@@ -76,6 +77,11 @@ impl ControlClient {
             "Version": 68,
             "Stream": false,
             "NodeKey": self.node_key.public_key_string(),
+            "Hostinfo": {
+                "Hostname": self.config.hostname,
+                "OS": std::env::consts::OS,
+                "GoArch": std::env::consts::ARCH,
+            },
         });
 
         let map_body = serde_json::to_vec(&map_request)

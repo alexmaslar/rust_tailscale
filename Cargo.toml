@@ -51,8 +51,12 @@ async-trait = "0.1"
 futures = "0.3"
 pin-project-lite = "0.2"
 
+# Crypto (for Tailscale-compatible big-endian nonce ChaChaPoly)
+chacha20poly1305 = "0.10"
+
 # Misc
 base64 = "0.22"
+hex = "0.4"
 bytes = "1"
 url = "2"
 

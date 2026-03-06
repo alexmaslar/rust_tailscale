@@ -77,7 +77,7 @@ impl MachineKey {
     }
 
     pub fn public_key_string(&self) -> String {
-        format!("mkey:{}", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(self.public))
+        format!("mkey:{}", hex::encode(self.public))
     }
 }
 
@@ -107,7 +107,7 @@ impl NodeKey {
     }
 
     pub fn public_key_string(&self) -> String {
-        format!("nodekey:{}", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(self.public))
+        format!("nodekey:{}", hex::encode(self.public))
     }
 }
 
@@ -132,19 +132,28 @@ impl DiscoKey {
     }
 
     pub fn public_key_string(&self) -> String {
-        format!("discokey:{}", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(self.public))
+        format!("discokey:{}", hex::encode(self.public))
     }
 }
 
-/// Parse a key from its string representation (e.g., "nodekey:base64data").
+/// Parse a key from its string representation.
+///
+/// Accepts both hex-encoded (64 chars) and base64url-encoded data after the
+/// prefix, e.g. `"mkey:7d2792f9..."` (hex) or `"nodekey:fTKS-ck..."` (base64url).
 pub fn parse_key(s: &str) -> Result<(String, [u8; 32])> {
     let (prefix, data) = s
         .split_once(':')
         .ok_or_else(|| TailscaleError::Key(format!("invalid key format: {}", s)))?;
 
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(data)
-        .map_err(|e| TailscaleError::Key(format!("invalid base64: {}", e)))?;
+    // 64 hex chars = 32 bytes; try hex first since the control plane now returns hex
+    let bytes = if data.len() == 64 && data.chars().all(|c| c.is_ascii_hexdigit()) {
+        hex::decode(data)
+            .map_err(|e| TailscaleError::Key(format!("invalid hex: {}", e)))?
+    } else {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(data)
+            .map_err(|e| TailscaleError::Key(format!("invalid base64: {}", e)))?
+    };
 
     let arr: [u8; 32] = bytes
         .try_into()

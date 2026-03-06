@@ -9,6 +9,8 @@ use super::http::ControlHttp;
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct RegisterRequest {
+    /// Client capability version (required by control server)
+    pub version: u64,
     /// Node's WireGuard public key
     pub node_key: String,
     /// Previous node key (empty for first registration)
@@ -70,6 +72,10 @@ pub struct LoginInfo {
     pub login_name: String,
 }
 
+/// Capability version we advertise to the control server.
+/// This should be kept reasonably current with Tailscale's Go client.
+const CAPABILITY_VERSION: u64 = 68;
+
 /// Build a RegisterRequest for pre-auth key registration.
 pub fn build_register_request(
     node_key: &str,
@@ -78,6 +84,7 @@ pub fn build_register_request(
     ephemeral: bool,
 ) -> RegisterRequest {
     RegisterRequest {
+        version: CAPABILITY_VERSION,
         node_key: node_key.to_string(),
         old_node_key: None,
         auth: AuthInfo {

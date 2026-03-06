@@ -1,3 +1,4 @@
+use base64::Engine;
 use crate::error::{Result, TailscaleError};
 use crate::keys::MachineKey;
 use snow::TransportState;
@@ -6,15 +7,24 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
 
+/// Protocol version sent in the initiationMessage and used in the handshake prologue.
+const PROTOCOL_VERSION: u16 = 1;
+
 /// An established Noise IK session for communicating with the control plane.
 pub struct NoiseSession {
     transport: TransportState,
+    send_nonce: u64,
+    recv_nonce: u64,
 }
 
 impl NoiseSession {
     /// Wrap an already-completed transport state.
     pub(crate) fn from_transport(transport: TransportState) -> Self {
-        Self { transport }
+        Self {
+            transport,
+            send_nonce: 0,
+            recv_nonce: 0,
+        }
     }
 
     /// Encrypt a message using the Noise session.
@@ -24,6 +34,7 @@ impl NoiseSession {
             .transport
             .write_message(plaintext, &mut buf)
             .map_err(|e| TailscaleError::Control(format!("noise encrypt failed: {e}")))?;
+        self.send_nonce += 1;
         buf.truncate(len);
         Ok(buf)
     }
@@ -35,6 +46,7 @@ impl NoiseSession {
             .transport
             .read_message(ciphertext, &mut buf)
             .map_err(|e| TailscaleError::Control(format!("noise decrypt failed: {e}")))?;
+        self.recv_nonce += 1;
         buf.truncate(len);
         Ok(buf)
     }
@@ -42,7 +54,7 @@ impl NoiseSession {
 
 /// Fetch the control server's Noise public key from /key?v=68.
 ///
-/// Response JSON: `{"LegacyPublicKey":"...","PublicKey":"nodekey:base64..."}`
+/// Response JSON: `{"publicKey":"mkey:base64...","legacyPublicKey":"mkey:base64..."}`
 pub async fn fetch_server_key(
     control_url: &str,
     client: &reqwest::Client,
@@ -68,10 +80,11 @@ pub async fn fetch_server_key(
         .await
         .map_err(|e| TailscaleError::Control(format!("failed to parse key response: {e}")))?;
 
-    // The PublicKey field is "nodekey:<base64url>" format
-    let key_str = body["PublicKey"]
+    // Accept both camelCase (current API) and PascalCase (legacy)
+    let key_str = body["publicKey"]
         .as_str()
-        .ok_or_else(|| TailscaleError::Control("key response missing PublicKey field".into()))?;
+        .or_else(|| body["PublicKey"].as_str())
+        .ok_or_else(|| TailscaleError::Control("key response missing publicKey field".into()))?;
 
     let (_prefix, key_bytes) = crate::keys::parse_key(key_str)?;
     tracing::debug!("fetched server noise key");
@@ -81,20 +94,31 @@ pub async fn fetch_server_key(
 /// Build a snow initiator for the Noise_IK handshake.
 ///
 /// Pattern IK: the initiator knows the responder's static public key.
-/// Cipher: ChaChaPoly, DH: 25519, Hash: SHA256
+/// Cipher: ChaChaPoly, DH: 25519, Hash: BLAKE2s (matches Tailscale's control protocol)
+///
+/// Uses a custom CryptoResolver with big-endian ChaChaPoly nonce encoding
+/// to match Tailscale's `controlbase/conn.go` implementation.
 fn build_initiator(
     machine_key: &MachineKey,
     server_public_key: &[u8; 32],
 ) -> Result<snow::HandshakeState> {
-    let params: snow::params::NoiseParams = "Noise_IK_25519_ChaChaPoly_SHA256"
+    let params: snow::params::NoiseParams = "Noise_IK_25519_ChaChaPoly_BLAKE2s"
         .parse()
         .map_err(|e| TailscaleError::Control(format!("invalid noise params: {e}")))?;
 
+    // Tailscale mixes a protocol-version prologue into the handshake hash
+    // before any standard Noise operations. Both sides must agree on this.
+    let prologue = format!("Tailscale Control Protocol v{}", PROTOCOL_VERSION);
+
     let kp = machine_key.key_pair();
     let secret_bytes = kp.secret_bytes();
-    let builder = snow::Builder::new(params)
+
+    // Use TailscaleResolver for big-endian ChaChaPoly nonces
+    let resolver = Box::new(super::resolver::TailscaleResolver::new());
+    let builder = snow::Builder::with_resolver(params, resolver)
         .local_private_key(&secret_bytes)
-        .remote_public_key(server_public_key);
+        .remote_public_key(server_public_key)
+        .prologue(prologue.as_bytes());
 
     builder
         .build_initiator()
@@ -123,11 +147,27 @@ pub async fn perform_handshake(
 
     // Step 2: Build the Noise initiator and generate msg1
     let mut handshake = build_initiator(machine_key, &server_key)?;
-    let mut msg1 = vec![0u8; 96];
-    let msg1_len = handshake
-        .write_message(&[], &mut msg1)
+    let mut noise_msg1 = vec![0u8; 96];
+    let noise_msg1_len = handshake
+        .write_message(&[], &mut noise_msg1)
         .map_err(|e| TailscaleError::Control(format!("handshake write failed: {e}")))?;
-    msg1.truncate(msg1_len);
+    noise_msg1.truncate(noise_msg1_len);
+
+    // Wrap in Tailscale's initiationMessage framing (5-byte header + payload):
+    //   [0-1] protocol version (uint16 BE) = 1
+    //   [2]   message type = 0x01 (initiation)
+    //   [3-4] payload length (uint16 BE)
+    let payload_len = noise_msg1.len() as u16;
+    let mut msg1 = Vec::with_capacity(5 + noise_msg1.len());
+    msg1.extend_from_slice(&PROTOCOL_VERSION.to_be_bytes());
+    msg1.push(0x01); // msgTypeInitiation
+    msg1.extend_from_slice(&payload_len.to_be_bytes());
+    msg1.extend_from_slice(&noise_msg1);
+    tracing::debug!(
+        noise_payload_len = noise_msg1_len,
+        framed_len = msg1.len(),
+        "built initiationMessage"
+    );
 
     // Step 3: Parse control URL, resolve hostname, open TLS connection
     let parsed = url::Url::parse(control_url)
@@ -163,30 +203,23 @@ pub async fn perform_handshake(
         .await
         .map_err(|e| TailscaleError::Control(format!("TLS connect failed: {e}")))?;
 
-    // Step 4: Send HTTP upgrade request with msg1 as body
-    // Tailscale's ts2021 protocol: the machine key is sent as the Upgrade header value
-    // to help the server identify which Noise key to use.
-    let machine_key_str = machine_key.public_key_string();
+    // Step 4: Send HTTP upgrade request with msg1 in the X-Tailscale-Handshake header.
+    // The Go client sends the Noise init message base64-encoded in this header to
+    // save an RTT (the server can start the handshake immediately from the header).
+    let handshake_b64 = base64::engine::general_purpose::STANDARD.encode(&msg1);
     let upgrade_request = format!(
         "POST /ts2021 HTTP/1.1\r\n\
          Host: {hostname}\r\n\
          Upgrade: tailscale-control-protocol\r\n\
          Connection: Upgrade\r\n\
-         X-Tailscale-Handshake-Machine-Key: {machine_key_str}\r\n\
-         Content-Type: application/octet-stream\r\n\
-         Content-Length: {}\r\n\
-         \r\n",
-        msg1.len()
+         X-Tailscale-Handshake: {handshake_b64}\r\n\
+         \r\n"
     );
 
     tls_stream
         .write_all(upgrade_request.as_bytes())
         .await
         .map_err(|e| TailscaleError::Control(format!("failed to write upgrade request: {e}")))?;
-    tls_stream
-        .write_all(&msg1)
-        .await
-        .map_err(|e| TailscaleError::Control(format!("failed to write msg1: {e}")))?;
     tls_stream
         .flush()
         .await
@@ -237,7 +270,12 @@ pub async fn perform_handshake(
         )));
     }
 
-    tracing::debug!("received HTTP 101 Switching Protocols");
+    tracing::debug!(
+        total_read,
+        header_end,
+        headers = headers_str,
+        "received HTTP 101 Switching Protocols"
+    );
 
     // Extract Content-Length from response headers (for msg2 body)
     let content_length = parse_content_length(headers_str);
@@ -250,28 +288,27 @@ pub async fn perform_handshake(
     if body_start < total_read {
         msg2.extend_from_slice(&response_buf[body_start..total_read]);
     }
+    tracing::debug!(
+        body_start,
+        total_read,
+        buffered_msg2_len = msg2.len(),
+        content_length = ?content_length,
+        "post-101 body state"
+    );
 
-    // Read remaining body bytes if Content-Length tells us we need more
-    if let Some(cl) = content_length {
-        while msg2.len() < cl {
-            let mut tmp = vec![0u8; cl - msg2.len()];
-            let n = tls_stream
-                .read(&mut tmp)
-                .await
-                .map_err(|e| TailscaleError::Control(format!("failed to read msg2: {e}")))?;
-            if n == 0 {
-                break;
-            }
-            msg2.extend_from_slice(&tmp[..n]);
-        }
-    } else if msg2.is_empty() {
-        // No Content-Length header and no body yet — read a chunk
-        // The server should send msg2 (48 bytes for Noise IK responder message)
-        let mut tmp = vec![0u8; 256];
+    // Read the responseMessage (51 bytes: 3-byte header + 48-byte Noise msg2).
+    // The server writes this on the raw connection after the HTTP 101 headers.
+    let expected_msg2_len = content_length.unwrap_or(51);
+    while msg2.len() < expected_msg2_len {
+        let mut tmp = vec![0u8; expected_msg2_len - msg2.len()];
         let n = tls_stream
             .read(&mut tmp)
             .await
             .map_err(|e| TailscaleError::Control(format!("failed to read msg2: {e}")))?;
+        tracing::debug!(read_bytes = n, total_msg2 = msg2.len() + n, "reading msg2");
+        if n == 0 {
+            break;
+        }
         msg2.extend_from_slice(&tmp[..n]);
     }
 
@@ -280,11 +317,26 @@ pub async fn perform_handshake(
             "no Noise msg2 in upgrade response".into(),
         ));
     }
+    tracing::debug!(
+        msg2_len = msg2.len(),
+        msg2_hex = hex::encode(&msg2),
+        "received msg2"
+    );
 
-    // Step 6: Process msg2 and transition to transport mode
+    // Step 6: Strip Tailscale's responseMessage framing (3-byte header):
+    //   [0]   message type = 0x02 (response)
+    //   [1-2] payload length (uint16 BE)
+    // Then process the Noise payload and transition to transport mode.
+    if msg2.len() < 3 {
+        return Err(TailscaleError::Control(format!(
+            "msg2 too short: {} bytes",
+            msg2.len()
+        )));
+    }
+    let noise_msg2 = &msg2[3..];
     let mut payload = vec![0u8; 256];
     let payload_len = handshake
-        .read_message(&msg2, &mut payload)
+        .read_message(noise_msg2, &mut payload)
         .map_err(|e| TailscaleError::Control(format!("handshake read_message failed: {e}")))?;
 
     if payload_len > 0 {

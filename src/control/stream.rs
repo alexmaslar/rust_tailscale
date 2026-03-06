@@ -8,13 +8,26 @@ use tokio_rustls::client::TlsStream;
 
 use super::noise::NoiseSession;
 
+/// Tailscale Noise transport message type for session data.
+const MSG_TYPE_RECORD: u8 = 0x04;
+/// Header: 1 byte type + 2 byte BE length.
+const HEADER_LEN: usize = 3;
+/// Max frame (header + ciphertext): 4096 bytes.
+const MAX_FRAME_SIZE: usize = 4096;
+/// Max ciphertext per frame: 4093 bytes.
+const MAX_CIPHERTEXT_SIZE: usize = MAX_FRAME_SIZE - HEADER_LEN;
+/// ChaCha20Poly1305 auth tag overhead.
+const AEAD_OVERHEAD: usize = 16;
+/// Max plaintext per frame: 4076 bytes.
+const MAX_PLAINTEXT_SIZE: usize = MAX_CIPHERTEXT_SIZE - AEAD_OVERHEAD;
+
 /// A framed Noise-encrypted stream over TLS.
 ///
 /// Implements `AsyncRead + AsyncWrite` so it can be used as a transport
-/// for HTTP/2 (h2 crate). Each write is encrypted and length-prefixed;
-/// each read decrypts a length-prefixed ciphertext frame.
+/// for HTTP/2 (h2 crate). Each write is encrypted with Tailscale's frame format;
+/// each read decrypts a framed ciphertext.
 ///
-/// Frame format: `[4-byte BE length][encrypted payload]`
+/// Frame format: `[1-byte type][2-byte BE ciphertext length][ciphertext]`
 pub struct NoiseStream {
     inner: TlsStream<TcpStream>,
     session: NoiseSession,
@@ -22,8 +35,10 @@ pub struct NoiseStream {
     read_plaintext: BytesMut,
     /// Partial frame being read from the wire
     read_frame_buf: BytesMut,
-    /// Expected frame length (None = haven't read length prefix yet)
+    /// Expected ciphertext length (None = haven't read header yet)
     read_frame_len: Option<usize>,
+    /// Buffered frame data to write (for partial writes)
+    write_buf: BytesMut,
 }
 
 impl NoiseStream {
@@ -34,6 +49,7 @@ impl NoiseStream {
             read_plaintext: BytesMut::new(),
             read_frame_buf: BytesMut::new(),
             read_frame_len: None,
+            write_buf: BytesMut::new(),
         }
     }
 }
@@ -55,18 +71,17 @@ impl AsyncRead for NoiseStream {
 
         // Need to read a new frame from the wire
         loop {
-            // Step 1: Read the 4-byte length prefix if we don't have it
+            // Step 1: Read the 3-byte header if we don't have it
             if this.read_frame_len.is_none() {
-                while this.read_frame_buf.len() < 4 {
-                    let mut tmp = [0u8; 4];
-                    let remaining = 4 - this.read_frame_buf.len();
+                while this.read_frame_buf.len() < HEADER_LEN {
+                    let mut tmp = [0u8; HEADER_LEN];
+                    let remaining = HEADER_LEN - this.read_frame_buf.len();
                     let mut read_buf = ReadBuf::new(&mut tmp[..remaining]);
                     let inner = Pin::new(&mut this.inner);
                     match inner.poll_read(cx, &mut read_buf) {
                         Poll::Ready(Ok(())) => {
                             let filled = read_buf.filled();
                             if filled.is_empty() {
-                                // EOF
                                 return Poll::Ready(Ok(()));
                             }
                             this.read_frame_buf.extend_from_slice(filled);
@@ -76,19 +91,35 @@ impl AsyncRead for NoiseStream {
                     }
                 }
 
-                let len_bytes: [u8; 4] = this.read_frame_buf.split_to(4)[..4]
-                    .try_into()
-                    .unwrap();
-                let frame_len = u32::from_be_bytes(len_bytes) as usize;
+                let header = this.read_frame_buf.split_to(HEADER_LEN);
+                let msg_type = header[0];
+                let ciphertext_len =
+                    u16::from_be_bytes([header[1], header[2]]) as usize;
 
-                if frame_len == 0 || frame_len > 1024 * 1024 {
+                tracing::debug!(
+                    msg_type = format!("0x{:02x}", msg_type),
+                    ciphertext_len,
+                    "noise frame header"
+                );
+
+                if msg_type != MSG_TYPE_RECORD {
                     return Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        format!("invalid noise frame length: {frame_len}"),
+                        format!(
+                            "unexpected noise frame type: 0x{:02x} (expected 0x{:02x})",
+                            msg_type, MSG_TYPE_RECORD
+                        ),
                     )));
                 }
 
-                this.read_frame_len = Some(frame_len);
+                if ciphertext_len == 0 || ciphertext_len > MAX_CIPHERTEXT_SIZE {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("invalid noise frame ciphertext length: {ciphertext_len}"),
+                    )));
+                }
+
+                this.read_frame_len = Some(ciphertext_len);
                 this.read_frame_buf.clear();
             }
 
@@ -120,6 +151,11 @@ impl AsyncRead for NoiseStream {
             let ciphertext = this.read_frame_buf.split_to(frame_len);
             this.read_frame_len = None;
 
+            tracing::debug!(
+                ciphertext_len = ciphertext.len(),
+                ciphertext_hex = %hex::encode(&ciphertext[..std::cmp::min(32, ciphertext.len())]),
+                "decrypting noise frame"
+            );
             let plaintext = this.session.decrypt(&ciphertext).map_err(|e| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -149,47 +185,70 @@ impl AsyncWrite for NoiseStream {
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
 
+        // If we have a partial frame from a previous call, finish writing it first
+        if !this.write_buf.is_empty() {
+            while !this.write_buf.is_empty() {
+                let inner = Pin::new(&mut this.inner);
+                match inner.poll_write(cx, &this.write_buf) {
+                    Poll::Ready(Ok(n)) => {
+                        if n == 0 {
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::WriteZero,
+                                "write returned 0",
+                            )));
+                        }
+                        let _ = this.write_buf.split_to(n);
+                    }
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+            // Fall through to process the new data in buf
+        }
+
+        // Chunk plaintext to fit in a single Noise frame
+        let chunk = &buf[..std::cmp::min(buf.len(), MAX_PLAINTEXT_SIZE)];
+
+        tracing::debug!(
+            plaintext_len = chunk.len(),
+            plaintext_hex = %hex::encode(&chunk[..std::cmp::min(32, chunk.len())]),
+            "encrypting noise frame"
+        );
+
         // Encrypt the plaintext
-        let ciphertext = this.session.encrypt(buf).map_err(|e| {
+        let ciphertext = this.session.encrypt(chunk).map_err(|e| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("noise encrypt failed: {e}"),
             )
         })?;
 
-        // Build length-prefixed frame
-        let len = ciphertext.len() as u32;
-        let mut frame = Vec::with_capacity(4 + ciphertext.len());
-        frame.extend_from_slice(&len.to_be_bytes());
+        // Build framed message: [type][2-byte BE length][ciphertext]
+        let ct_len = ciphertext.len() as u16;
+        let mut frame = Vec::with_capacity(HEADER_LEN + ciphertext.len());
+        frame.push(MSG_TYPE_RECORD);
+        frame.extend_from_slice(&ct_len.to_be_bytes());
         frame.extend_from_slice(&ciphertext);
 
-        // Write the entire frame — we need to write all of it
-        let mut written = 0;
-        while written < frame.len() {
-            let inner = Pin::new(&mut this.inner);
-            match inner.poll_write(cx, &frame[written..]) {
-                Poll::Ready(Ok(n)) => {
-                    if n == 0 {
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::WriteZero,
-                            "write returned 0",
-                        )));
-                    }
-                    written += n;
+        // Write the entire frame
+        let inner = Pin::new(&mut this.inner);
+        match inner.poll_write(cx, &frame) {
+            Poll::Ready(Ok(n)) => {
+                if n == 0 {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "write returned 0",
+                    )));
                 }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => {
-                    if written > 0 {
-                        // Partial frame written — this is problematic but we
-                        // report success for the plaintext bytes we accepted
-                        return Poll::Ready(Ok(buf.len()));
-                    }
-                    return Poll::Pending;
+                if n < frame.len() {
+                    // Buffer the remainder for next poll_write
+                    this.write_buf.extend_from_slice(&frame[n..]);
                 }
+                Poll::Ready(Ok(chunk.len()))
             }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => Poll::Pending,
         }
-
-        Poll::Ready(Ok(buf.len()))
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {

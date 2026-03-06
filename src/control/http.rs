@@ -27,7 +27,6 @@ impl ControlHttp {
         let (session, tls_stream) =
             super::noise::perform_handshake(machine_key, &base_url, http_client).await?;
 
-        // Wrap in NoiseStream for transparent encrypt/decrypt
         let noise_stream = NoiseStream::new(tls_stream, session);
 
         // Establish HTTP/2 connection over the Noise stream

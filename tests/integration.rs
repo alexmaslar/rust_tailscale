@@ -5,6 +5,10 @@ use rust_tailscale::{TailscaleConfig, TailscaleServer};
 #[tokio::test]
 #[ignore = "requires TS_AUTHKEY environment variable"]
 async fn test_server_start_and_identity() {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
+
     let config = TailscaleConfig::builder()
         .hostname("integration-test")
         .auth_key(std::env::var("TS_AUTHKEY").unwrap())
